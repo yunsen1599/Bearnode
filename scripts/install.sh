@@ -269,20 +269,20 @@ install_npnode() {
     cd /usr/local/NPanel-node/
 
     if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/yunsen1599/NPnode-release/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        last_version=$(curl -Ls "https://api.github.com/repos/yunsen1599/Bearnode/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ ! -n "$last_version" ]]; then
             echo -e "${red}检测 NPanel-node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 NPanel-node 版本安装${plain}"
             exit 1
         fi
         echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/yunsen1599/NPnode-release/releases/download/${last_version}/npnode-linux-${arch}.zip"
+        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
         if ! curl -fL --retry 3 --connect-timeout 10 "$url" | pv -s 30M -W -N "下载进度" > /usr/local/NPanel-node/npnode-linux.zip; then
             echo -e "${red}下载 NPanel-node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
             exit 1
         fi
     else
     last_version=$version_param
-        url="https://github.com/yunsen1599/NPnode-release/releases/download/${last_version}/npnode-linux-${arch}.zip"
+        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
         if ! curl -fL --retry 3 --connect-timeout 10 "$url" | pv -s 30M -W -N "下载进度" > /usr/local/NPanel-node/npnode-linux.zip; then
             echo -e "${red}下载 NPanel-node $1 失败，请确保此版本存在${plain}"
             exit 1
@@ -385,7 +385,7 @@ EOF
     fi
 
 
-    curl -o /usr/bin/npnode -Ls https://raw.githubusercontent.com/yunsen1599/NPnode-release/main/scripts/npnode.sh
+    curl -o /usr/bin/npnode -Ls https://raw.githubusercontent.com/yunsen1599/Bearnode/main/scripts/npnode.sh
     chmod +x /usr/bin/npnode
 
     cd $cur_dir
