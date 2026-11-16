@@ -242,6 +242,11 @@ Api:
   SecretKey: ${secret_key}
   # 请求超时时间（单位：秒）
   Timeout: 30
+
+Grpc:
+  # 默认开启 gRPC（推送用户 / 配置变更、上报流量），地址留空时从 ApiHost 推出；面板没开放时自动改用 HTTP
+  Enable: true
+  Addr:
 EOF
         echo -e "${green}NPanel-node 配置文件生成完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
