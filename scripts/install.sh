@@ -41,6 +41,9 @@ VERSION_ARG=""
 API_HOST_ARG=""
 SERVER_ID_ARG=""
 SECRET_KEY_ARG=""
+PACKAGE_ARG=""
+CHECKSUMS_ARG=""
+MANAGE_SCRIPT_ARG=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -51,8 +54,18 @@ parse_args() {
                 SERVER_ID_ARG="$2"; shift 2 ;;
             --secret-key)
                 SECRET_KEY_ARG="$2"; shift 2 ;;
+            --package)
+                PACKAGE_ARG="$2"; shift 2 ;;
+            --checksums)
+                CHECKSUMS_ARG="$2"; shift 2 ;;
+            --manage-script)
+                MANAGE_SCRIPT_ARG="$2"; shift 2 ;;
             -h|--help)
                 echo "用法: $0 [版本号] [--api-host URL] [--server-id ID] [--secret-key KEY]"
+                echo "      [--package npnode-linux-<arch>.zip|.tar.gz [--checksums checksums.txt]] [--manage-script npnode.sh]"
+                echo "  --package       用本地安装包安装（机器连不上 GitHub 时使用；tar.gz 不需要 unzip）"
+                echo "  传了 --api-host / --server-id / --secret-key 时会重新生成配置（旧配置备份为 config.yml.bak）"
+                echo "  退出码 20 表示下载不了安装包（面板远程安装据此改为直传）"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -110,6 +123,10 @@ elif [[ x"${release}" == x"debian" ]]; then
     fi
 fi
 
+# 软件源不可用时不要卡太久（装不上的依赖后面有兜底：没有 pv 不显示进度，没有 curl 用 wget）
+pm_timeout=""
+command -v timeout >/dev/null 2>&1 && pm_timeout="timeout 300"
+
 install_base() {
     need_install_apt() {
         local packages=("$@")
@@ -126,8 +143,8 @@ install_base() {
 
         if [[ ${#missing[@]} -gt 0 ]]; then
             echo "安装缺失的包: ${missing[*]}"
-            apt-get update -y >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1
+            $pm_timeout apt-get update -y >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive $pm_timeout apt-get install -y "${missing[@]}" >/dev/null 2>&1
         fi
     }
 
@@ -146,7 +163,7 @@ install_base() {
 
         if [[ ${#missing[@]} -gt 0 ]]; then
             echo "安装缺失的包: ${missing[*]}"
-            yum install -y "${missing[@]}" >/dev/null 2>&1
+            $pm_timeout yum install -y "${missing[@]}" >/dev/null 2>&1
         fi
     }
 
@@ -165,7 +182,7 @@ install_base() {
 
         if [[ ${#missing[@]} -gt 0 ]]; then
             echo "安装缺失的包: ${missing[*]}"
-            apk add --no-cache "${missing[@]}" >/dev/null 2>&1
+            $pm_timeout apk add --no-cache "${missing[@]}" >/dev/null 2>&1
         fi
     }
 
@@ -174,7 +191,7 @@ install_base() {
         # 检查并安装 epel-release
         if ! rpm -q epel-release >/dev/null 2>&1; then
             echo "安装 EPEL 源..."
-            yum install -y epel-release >/dev/null 2>&1
+            $pm_timeout yum install -y epel-release >/dev/null 2>&1
         fi
         need_install_yum wget curl unzip tar cronie socat ca-certificates pv
         update-ca-trust force-enable >/dev/null 2>&1 || true
@@ -189,10 +206,10 @@ install_base() {
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "更新包数据库..."
-        pacman -Sy --noconfirm >/dev/null 2>&1
+        $pm_timeout pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed 会跳过已安装的包，非常高效
         echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
+        $pm_timeout pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
     fi
 }
 
@@ -264,42 +281,111 @@ EOF
         fi
 }
 
+# 下载不了安装包：以退出码 20 退出（面板远程安装据此改为直传安装包）
+download_failed() {
+    echo -e "${red}$*${plain}"
+    echo -e "${yellow}机器连不上 GitHub 时，可以在别处下载 npnode-linux-${arch}.zip 传上来，用 --package 安装${plain}"
+    exit 20
+}
+
+# fetch URL 输出文件：优先 curl（有 pv 时显示进度），没有 curl 用 wget
+fetch() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        if command -v pv >/dev/null 2>&1 && [[ -t 2 ]]; then
+            curl -fL --retry 3 --connect-timeout 10 "$url" | pv -s 30M -W -N "下载进度" > "$out"
+        else
+            curl -fsSL --retry 3 --connect-timeout 10 -o "$out" "$url"
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=3 --timeout=30 -O "$out" "$url"
+    else
+        return 1
+    fi
+}
+
+# zip_test / zip_extract：.tar.gz 用 tar；zip 优先 unzip，没有就用 python3 自带的 zipfile
+# （面板直传时会把 zip 转成 tar.gz，目标机不需要 unzip）
+zip_test() {
+    if [[ "$1" == *.tar.gz ]]; then
+        tar -tzf "$1" >/dev/null 2>&1
+    elif command -v unzip >/dev/null 2>&1; then
+        unzip -tq "$1" >/dev/null 2>&1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -m zipfile -t "$1" >/dev/null 2>&1
+    else
+        echo -e "${red}缺少 unzip（自动安装失败），也没有 python3，无法解压安装包${plain}"
+        exit 1
+    fi
+}
+zip_extract() {
+    if [[ "$1" == *.tar.gz ]]; then
+        tar -xzf "$1" -C "$2"
+    elif command -v unzip >/dev/null 2>&1; then
+        unzip -o "$1" -d "$2"
+    else
+        python3 -m zipfile -e "$1" "$2"
+    fi
+}
+
 install_npnode() {
     local version_param="$1"
+    local work
+    work=$(mktemp -d)
+    # 任何退出（包括下载失败退出码 20）都清掉临时目录
+    trap 'rm -rf "$work"' EXIT
+    local zip="$work/npnode-linux-${arch}.zip"
+
+    # 先把安装包准备好并校验，再替换现有安装：下载失败不会把正在运行的节点删掉
+    if [[ -n "$PACKAGE_ARG" ]]; then
+        [[ -f "$PACKAGE_ARG" ]] || { echo -e "${red}安装包不存在：${PACKAGE_ARG}${plain}"; exit 1; }
+        echo -e "${green}使用本地安装包 ${PACKAGE_ARG}${plain}"
+        if [[ "$PACKAGE_ARG" == *.tar.gz || "$PACKAGE_ARG" == *.tgz ]]; then
+            zip="$work/npnode-linux-${arch}.tar.gz"
+        fi
+        cp "$PACKAGE_ARG" "$zip"
+        last_version="(本地安装包)"
+        if [[ -n "$CHECKSUMS_ARG" ]]; then
+            [[ -f "$CHECKSUMS_ARG" ]] || { echo -e "${red}校验文件不存在：${CHECKSUMS_ARG}${plain}"; exit 1; }
+            cp "$CHECKSUMS_ARG" "$work/checksums.txt"
+            if ! (cd "$work" && grep " $(basename "$zip")\$" checksums.txt | sha256sum -c - >/dev/null 2>&1); then
+                echo -e "${red}安装包校验失败（本机架构需要 $(basename "$zip")）${plain}"
+                exit 1
+            fi
+        fi
+    else
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            download_failed "没有 curl 也没有 wget（软件源不可用？），无法下载 NPanel-node"
+        fi
+        if [[ -z "$version_param" ]]; then
+            last_version=""
+            if fetch "https://api.github.com/repos/yunsen1599/Bearnode/releases/latest" "$work/latest.json"; then
+                last_version=$(grep '"tag_name":' "$work/latest.json" | sed -E 's/.*"([^"]+)".*/\1/')
+            fi
+            if [[ -z "$last_version" ]]; then
+                download_failed "检测 NPanel-node 版本失败：连不上 GitHub，或超出 Github API 限制（可稍后再试，或手动指定版本）"
+            fi
+            echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
+        else
+            last_version=$version_param
+        fi
+        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
+        if ! fetch "$url" "$zip"; then
+            download_failed "下载 NPanel-node ${last_version} 失败，请确保此版本存在、服务器能够下载 Github 的文件"
+        fi
+    fi
+
+    if ! zip_test "$zip"; then
+        echo -e "${red}NPanel-node 安装包无效，请检查版本或稍后重试${plain}"
+        exit 1
+    fi
     if [[ -e /usr/local/NPanel-node/ ]]; then
         rm -rf /usr/local/NPanel-node/
     fi
-
     mkdir /usr/local/NPanel-node/ -p
     cd /usr/local/NPanel-node/
-
-    if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/yunsen1599/Bearnode/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$last_version" ]]; then
-            echo -e "${red}检测 NPanel-node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 NPanel-node 版本安装${plain}"
-            exit 1
-        fi
-        echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
-        if ! curl -fL --retry 3 --connect-timeout 10 "$url" | pv -s 30M -W -N "下载进度" > /usr/local/NPanel-node/npnode-linux.zip; then
-            echo -e "${red}下载 NPanel-node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-            exit 1
-        fi
-    else
-    last_version=$version_param
-        url="https://github.com/yunsen1599/Bearnode/releases/download/${last_version}/npnode-linux-${arch}.zip"
-        if ! curl -fL --retry 3 --connect-timeout 10 "$url" | pv -s 30M -W -N "下载进度" > /usr/local/NPanel-node/npnode-linux.zip; then
-            echo -e "${red}下载 NPanel-node $1 失败，请确保此版本存在${plain}"
-            exit 1
-        fi
-    fi
-
-    if ! unzip -tq npnode-linux.zip >/dev/null 2>&1; then
-        echo -e "${red}下载的 NPanel-node 安装包无效，请检查版本或稍后重试${plain}"
-        exit 1
-    fi
-    unzip -o npnode-linux.zip
-    rm npnode-linux.zip -f
+    zip_extract "$zip" /usr/local/NPanel-node/
+    rm -rf "$work"
     for required_file in npnode geoip.dat geosite.dat config.yml; do
         if [[ ! -f "$required_file" ]]; then
             echo -e "${red}安装包缺少 ${required_file}，请检查 Release 资产是否完整${plain}"
@@ -362,16 +448,18 @@ EOF
         echo -e "${green}NPanel-node ${last_version}${plain} 安装完成，已设置开机自启"
     fi
 
-    if [[ ! -f /etc/NPanel-node/config.yml ]]; then
-        # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
-        if [[ -n "$API_HOST_ARG" && -n "$SERVER_ID_ARG" && -n "$SECRET_KEY_ARG" ]]; then
-            generate_npnode_config "$API_HOST_ARG" "$SERVER_ID_ARG" "$SECRET_KEY_ARG"
-            echo -e "${green}已根据参数生成 /etc/NPanel-node/config.yml${plain}"
-            first_install=false
-        else
-            cp config.yml /etc/NPanel-node/
-            first_install=true
+    if [[ -n "$API_HOST_ARG" && -n "$SERVER_ID_ARG" && -n "$SECRET_KEY_ARG" ]]; then
+        # 通过参数传入了完整对接信息（面板一键 / 远程安装）：按参数生成配置，旧配置备份
+        if [[ -f /etc/NPanel-node/config.yml ]]; then
+            cp /etc/NPanel-node/config.yml /etc/NPanel-node/config.yml.bak
+            echo -e "${yellow}已有配置备份为 /etc/NPanel-node/config.yml.bak${plain}"
         fi
+        generate_npnode_config "$API_HOST_ARG" "$SERVER_ID_ARG" "$SECRET_KEY_ARG"
+        echo -e "${green}已根据参数生成 /etc/NPanel-node/config.yml${plain}"
+        first_install=false
+    elif [[ ! -f /etc/NPanel-node/config.yml ]]; then
+        cp config.yml /etc/NPanel-node/
+        first_install=true
     else
         if [[ x"${release}" == x"alpine" ]]; then
             service NPanel-node start
@@ -390,8 +478,16 @@ EOF
     fi
 
 
-    curl -o /usr/bin/npnode -Ls https://raw.githubusercontent.com/yunsen1599/Bearnode/main/scripts/npnode.sh
-    chmod +x /usr/bin/npnode
+    if [[ -n "$MANAGE_SCRIPT_ARG" && -f "$MANAGE_SCRIPT_ARG" ]]; then
+        cp "$MANAGE_SCRIPT_ARG" /usr/bin/npnode
+        chmod +x /usr/bin/npnode
+    elif fetch https://raw.githubusercontent.com/yunsen1599/Bearnode/main/scripts/npnode.sh /usr/bin/npnode.new; then
+        mv /usr/bin/npnode.new /usr/bin/npnode
+        chmod +x /usr/bin/npnode
+    else
+        rm -f /usr/bin/npnode.new
+        echo -e "${yellow}管理脚本 npnode 下载失败（不影响节点运行），之后可执行 npnode update 重新获取${plain}"
+    fi
 
     cd $cur_dir
     rm -f install.sh
